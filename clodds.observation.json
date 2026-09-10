@@ -1,0 +1,112 @@
+{
+  // ───────────────────────────────────────────────────────────────────────────
+  // Clodds — OBSERVATION-ONLY configuration
+  //
+  // Purpose: make the system collect evidence about whether a real edge exists,
+  // without ever placing a real order. See scripts/crypto-hft-backtest.ts for the
+  // offline companion to this.
+  //
+  // EVERY autonomous money path is pinned shut here. Do not flip these to false
+  // until the dry-run data has been reviewed:
+  //   signalRouter.dryRun  = true   (logs decisions, executes nothing)
+  //   trading.dryRun       = true
+  //   trading.enabled      = false
+  //
+  // NOTE ON THE THREE dryRun SWITCHES — they are genuinely independent in this
+  // codebase, so all of them must be set deliberately:
+  //   conversational orders  -> process.env.DRY_RUN         (credentials/index.ts:334)
+  //   futures orders         -> config.trading.dryRun       (gateway/index.ts:638)
+  //   autonomous signals     -> config.signalRouter.dryRun  (signal-router/router.ts:26)
+  // `process.env.DRY_RUN` is NOT optional: without it the agent's Polymarket /
+  // Kalshi / Opinion / Predict.fun order tools treat a request as live.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  gateway: {
+    port: 18789,
+    auth: {}
+  },
+
+  agents: {
+    defaults: {
+      // Left unset on purpose — `CLODDS_MODEL` / `ANTHROPIC_MODEL` now override this
+      // (utils/config.ts). Hardcoding a model here would silently win over the env
+      // var and, on a non-Anthropic base URL, send a Claude model name to that
+      // backend.
+    }
+  },
+
+  // ── The observation harness ────────────────────────────────────────────────
+  signalRouter: {
+    enabled: true,
+    dryRun: true,
+
+    // Keep the bar low so the router actually tells us something. With the
+    // default 0.5 almost everything is filtered out and we learn nothing about
+    // how many signals the strategies really produce.
+    minStrength: 0.3,
+
+    enabledPlatforms: ["polymarket"],
+
+    // Tiny sizes: numbers are irrelevant in dry-run, but keeping them small makes
+    // the log easier to read and bounds the blast radius if dryRun is ever
+    // accidentally cleared.
+    defaultSizeUsd: 10,
+    maxSizeUsd: 25,
+    strengthScaling: true,
+
+    maxDailyLoss: 50,
+    maxConcurrentPositions: 5,
+    cooldownMs: 120000,
+
+    // 'maker' avoids paying the taker fee in the fill model. Note the offline
+    // backtest found maker assumptions are exactly what does NOT get validated by
+    // 1-minute data — treat maker results sceptically.
+    orderMode: "maker",
+    maxSlippage: 0.02,
+    useSmartRouter: true,
+    useFeatureFilters: true
+  },
+
+  // ── Hard safety floor ─────────────────────────────────────────────────────
+  trading: {
+    enabled: false,
+    dryRun: true,
+    maxOrderSize: 100,
+    maxDailyLoss: 200,
+    marketMaking: { enabled: false },
+    cryptoHft: { enabled: false },
+    hftDivergence: { enabled: false }
+  },
+
+  // Keep every other autonomous executor off.
+  arbitrageExecution: { enabled: false, dryRun: true },
+  venueArbitrage: { enabled: false },
+  whaleTracking: { enabled: false },
+  copyTrading: { enabled: false, dryRun: true },
+
+  // ── Data sources ──────────────────────────────────────────────────────────
+  feeds: {
+    polymarket: { enabled: true, rtds: { enabled: false } },
+    kalshi: { enabled: false },
+    manifold: { enabled: false },
+    metaculus: { enabled: false },
+    predictit: { enabled: false }
+  },
+
+  // ── Optional: accumulate the tick history the offline backtester needs ────
+  // Disabled because it requires a PostgreSQL + TimescaleDB connection string
+  // (services/tick-recorder/timescale.ts). Until that exists, the round-driven
+  // backtester in src/strategies/crypto-hft/backtest.ts pulls its history from
+  // Polymarket's public APIs instead, which needs no infrastructure.
+  //
+  // tickRecorder: {
+  //   enabled: true,
+  //   connectionString: "postgresql://user:pass@localhost:5432/clodds_ticks",
+  //   platforms: ["polymarket"],
+  //   batchSize: 100,
+  //   flushIntervalMs: 1000,
+  //   retentionDays: 365
+  // },
+
+  logging: { level: "info" }
+}

@@ -450,6 +450,19 @@ export async function loadConfig(customPath?: string): Promise<Config> {
     };
   }
 
+  // Apply model env overrides.
+  // The agent resolves its model ONLY from config.agents.defaults.model.primary
+  // (see agents/index.ts selectAdaptiveModel), so ANTHROPIC_MODEL alone never
+  // reached the API call — a non-Anthropic base URL (e.g. a DeepSeek/OpenAI-
+  // compatible gateway) would be asked for 'claude-opus-4-6' and fail.
+  const envModel = process.env.CLODDS_MODEL || process.env.ANTHROPIC_MODEL;
+  if (envModel) {
+    if (!config.agents) (config as any).agents = {};
+    const defaults = (config.agents.defaults ??= {} as any);
+    const model = (defaults.model ??= {} as any);
+    model.primary = envModel;
+  }
+
   // Apply Percolator env var overrides
   if (process.env.PERCOLATOR_ENABLED || process.env.PERCOLATOR_SLAB) {
     if (!config.feeds) (config as any).feeds = {};

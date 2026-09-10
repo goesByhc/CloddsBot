@@ -85,3 +85,8 @@ CLAWDBOT_ARCHITECTURE.md
 # Standalone compute API server (monetization layer — hosted only)
 src/api/
 .vercel
+
+# never commit env backups (contain API keys)
+.env.bak*
+*.env.bak
+

@@ -25,9 +25,31 @@ export interface OrderExecution {
 
 // ── Taker Fee (Polymarket formula) ──────────────────────────────────────────
 
-/** fee_per_share = 0.125 * (price * (1 - price))^2 */
-export function takerFee(price: number): number {
-  return 0.125 * Math.pow(price * (1 - price), 2);
+/**
+ * Taker fee in USDC per share.
+ *
+ * Polymarket's documented formula is:  fee = C × feeRate × p × (1 − p)
+ * where C = shares and p = price, so per share:  feeRate × p × (1 − p).
+ *
+ * feeRate is per category. These short-duration crypto Up/Down markets report
+ * `feeType: "crypto_fees_v2"` and `feeSchedule.rate: 0.07`, so CRYPTO_FEE_RATE
+ * is the correct rate here.
+ *
+ * The previous implementation used 0.125 × (p(1−p))², which understates the fee
+ * except at p = 0.05 / 0.95. At p = 0.50 it returned 0.0078/share against the
+ * correct 0.0175 — a 2.25× underestimate, and the underestimate is worst exactly
+ * where these markets spend most of their life (near 0.50). Because the error
+ * biases every taker strategy's P&L upward, it must not be used for sizing or
+ * for deciding whether an edge survives fees.
+ *
+ * Makers pay no fee at all (see callers: fee is zero when `wasMaker`), so this
+ * function is only ever applied to taker fills.
+ */
+export const CRYPTO_FEE_RATE = 0.07;
+
+export function takerFee(price: number, feeRate: number = CRYPTO_FEE_RATE): number {
+  const p = Math.min(Math.max(price, 0), 1);
+  return feeRate * p * (1 - p);
 }
 
 export function takerFeePct(price: number): number {
