@@ -1233,6 +1233,185 @@ function openFrom(
   };
 }
 
+/**
+ * Entry points observed during a replay, for path analysis.
+ *
+ * `backtestFromTicks` only reports realised P&L, which cannot distinguish a stale
+ * entry price (real edge) from an assumed fill at a price that was already gone
+ * (artefact). Recording the raw observations lets a probe measure what happened
+ * AFTER each entry instead.
+ */
+export interface EntryObservation {
+  roundSlug: string;
+  t: number;
+  direction: Direction;
+  /** the traded side's price at the instant the signal fired */
+  entryPrice: number;
+  /** 0.5 + |spotMove|/100*5 as the live heuristic computes it */
+  expectedPrice: number;
+  gapCents: number;
+  spotMovePct: number;
+  /** same-side price k seconds later (last print at or before t+k) */
+  forward: Record<number, number | null>;
+  /** 1 if the traded side resolved to 1, 0 otherwise, null if unresolved */
+  finalPrice: number | null;
+}
+
+export interface TickBacktestResult extends BacktestResult {
+  entries: EntryObservation[];
+}
+
+/** Forward horizons (seconds) captured for each entry. */
+const FORWARD_HORIZONS = [15, 30, 60, 120, 300];
+
+/**
+ * Replay a single round purely to record entry observations, using the identical
+ * entry logic as `backtestFromTicks` but ignoring exits so every signal is seen.
+ */
+export function collectEntries(
+  rounds: TickRound[],
+  opts: TickBacktestOptions
+): EntryObservation[] {
+  const out: EntryObservation[] = [];
+  const spotTimes: number[] = [];
+  const spotPrices: number[] = [];
+  for (const p of opts.spot ?? []) {
+    spotTimes.push(p.t);
+    spotPrices.push(p.p);
+  }
+
+  for (const round of rounds) {
+    if (round.up.length + round.down.length < 20) continue;
+    const upBuf = createPurePriceBuffer();
+    const downBuf = createPurePriceBuffer();
+    const spotBuf = createPurePriceBuffer(600);
+
+    const times = Array.from(
+      new Set([...round.up.map((x) => x.t), ...round.down.map((x) => x.t)])
+    ).sort((a, b) => a - b);
+    if (times.length < 3) continue;
+
+    const upAt = new Map(round.up.map((x) => [x.t, x]));
+    const downAt = new Map(round.down.map((x) => [x.t, x]));
+
+    const spotLen = spotTimes.length;
+    let scan = 0;
+    while (scan < spotLen && spotTimes[scan] < round.startSec) scan++;
+
+    let lastUp = round.up[0]?.p ?? 0.5;
+    let lastDown = round.down[0]?.p ?? 0.5;
+    let lastSpot: number | null = null;
+    let lastUpT = round.up[0]?.t ?? round.startSec;
+    let lastDownT = round.down[0]?.t ?? round.startSec;
+
+    /**
+     * One entry per round, matching the backtest.
+     *
+     * `backtestFromTicks` only evaluates entries while flat, so after the first
+     * signal it opens a position and `continue`s on every later instant. Without
+     * this latch the probe recorded EVERY qualifying instant — 871 "entries" on
+     * SOL where the backtest makes 256 trades — which is a different population
+     * and explains the contradictory win rates (33.5% vs 74.6%).
+     */
+    let entered = false;
+
+    // Per-side series for forward lookups.
+    const upSeries = round.up;
+    const downSeries = round.down;
+
+    for (const t of times) {
+      const nowMs = t * 1000;
+      const upTick = upAt.get(t);
+      const downTick = downAt.get(t);
+      const up = upTick ? upTick.p : lastUp;
+      const down = downTick ? downTick.p : lastDown;
+      if (upTick) lastUpT = t;
+      if (downTick) lastDownT = t;
+      lastUp = up;
+      lastDown = down;
+
+      while (scan < spotLen && spotTimes[scan] <= t) {
+        lastSpot = spotPrices[scan];
+        spotBuf.push(lastSpot, spotTimes[scan] * 1000);
+        scan++;
+      }
+
+      upBuf.push(up, nowMs);
+      downBuf.push(down, nowMs);
+
+      const roundAgeSec = t - round.startSec;
+      const timeLeftSec = round.endSec - t;
+      if (roundAgeSec < 30) continue;
+      if (timeLeftSec < opts.minTimeLeftSec) continue;
+      if (entered) continue;
+
+      const polyAgeSec = Math.max(0, t - Math.max(lastUpT, lastDownT));
+      let sig: Signal | null = null;
+      let gapCents = 0;
+
+      if (opts.strategy === 'momentum') {
+        if (lastSpot === null) continue;
+        const spotMovePct = spotBuf.movePct(30, nowMs);
+        sig = evaluateMomentumPure(
+          { upPrice: up, downPrice: down, spotMovePct, polyAgeSec, spotWindowSec: 30 },
+          { ...DEFAULT_MOMENTUM, ...opts.strategyCfg?.momentum }
+        );
+        if (sig) {
+          const expected = 0.5 + (Math.abs(spotMovePct) / 100) * 5;
+          gapCents = (expected - sig.entryPrice) * 100;
+        }
+      } else if (opts.strategy === 'mean_reversion') {
+        const spotMovePct = spotBuf.count() >= 2 ? spotBuf.movePct(60, nowMs) : 0;
+        sig = evaluateMeanReversionPure(
+          { upPrice: up, downPrice: down, roundAgeSec, spotMovePct },
+          { ...DEFAULT_MR, ...opts.strategyCfg?.meanReversion }
+        );
+      } else {
+        const spotMovePct = spotBuf.count() >= 2 ? spotBuf.movePct(60, nowMs) : 0;
+        sig = evaluateExpiryFadePure(
+          { upPrice: up, downPrice: down, expiresAtMs: round.endSec * 1000, nowMs, spotMovePct },
+          { ...DEFAULT_EXPIRY_FADE, ...opts.strategyCfg?.expiryFade }
+        );
+      }
+      if (!sig) continue;
+      entered = true;
+
+      const series = sig.direction === 'up' ? upSeries : downSeries;
+      const forward: Record<number, number | null> = {};
+      for (const h of FORWARD_HORIZONS) {
+        let v: number | null = null;
+        for (const x of series) {
+          if (x.t > t + h) break;
+          if (x.t >= t) v = x.p;
+        }
+        forward[h] = v;
+      }
+
+      out.push({
+        roundSlug: round.slug,
+        t,
+        direction: sig.direction,
+        entryPrice: sig.entryPrice,
+        expectedPrice: sig.entryPrice + gapCents / 100,
+        gapCents,
+        spotMovePct: opts.strategy === 'momentum' ? spotBuf.movePct(30, nowMs) : 0,
+        forward,
+        finalPrice:
+          round.resolvedUp === null
+            ? null
+            : sig.direction === 'up'
+              ? round.resolvedUp >= 0.5
+                ? 1
+                : 0
+              : round.resolvedUp >= 0.5
+                ? 0
+                : 1,
+      });
+    }
+  }
+  return out;
+}
+
 export function backtestFromTicks(
   rounds: TickRound[],
   opts: TickBacktestOptions

@@ -246,6 +246,108 @@ that the staleness gate never binds.
 **`mean_reversion` — no setting works.** All 10 variants are negative; the least-bad
 (`expensiveThreshold` 0.85) is −$0.028/trade.
 
+---
+
+## 3d. What "win rate" actually measured — and a correction
+
+The cross-asset table above reports momentum winning 72–77% of trades. **That number
+does not mean what it appears to mean.** Chasing this down took the longest and produced
+the most important correction in this report.
+
+### The contradiction that exposed it
+
+A path probe (`scripts/probe-momentum-edge.ts`) recorded, for the same 256 SOL entries
+the backtest makes, what the traded side did afterwards:
+
+```
+backtest win rate           74.6%
+probe win rate AT SETTLEMENT 34.8%   (89/256)
+```
+
+Identical entries (256 = 256, matched on entry timestamp, entry-price deciles equal). So
+one of the two numbers had to be wrong about what it was measuring.
+
+### The explanation
+
+The instrument pays $1 or $0 at expiry. But the live exit rules take profit at **+15% of
+the entry price** and stop out at **−12%** (`positions.ts`). With a median entry near
+$0.26, +15% is **four cents**. So the strategy almost never holds to the payout.
+
+An early check of 12 matched trades showed **7 disagreeing on win/loss**: exits that were
+tagged `take_profit` (a win) frequently resolved *against* the position, and vice versa.
+
+**"Win rate" in the backtest measures whether the price wiggled up 15% before down 12%.
+It is not directional accuracy.** It is a volatility statistic.
+
+### The correction, and what really matters
+
+Because the payoff is asymmetric, settlement win rate is the wrong yardstick anyway. A
+contract bought at 0.26 that wins 31% of the time is profitable — (0.31 × 0.74) −
+(0.69 × 0.26) > 0. Comparing a 34.8% settlement rate against a 48.3% control rate is
+meaningless, because the control cohort sits at a median price of 0.49 and the flagged
+cohort at 0.26. Different prices, different payoffs.
+
+The correct question is what the same entries earn. Same 256 entries, same sizing:
+
+| Asset | Entries | Median entry | Settlement win% | Live exit rules | **Hold to settlement** |
+|---|---|---|---|---|---|
+| BTC | 81 | 0.260 | 30.9% | +$19.06 | **+$33.48** |
+| ETH | 131 | 0.240 | 30.5% | +$19.71 | **+$60.40** |
+| SOL | 256 | 0.260 | 34.8% | +$156.22 | **+$201.61** |
+
+Two findings:
+
+1. **The entries are longshots bought below their true probability.** Median entry 0.26–0.26
+   against a settlement win rate of 30.5–34.8%. That is a genuine mispricing — the market
+   underprices these contracts by roughly 5–9 percentage points.
+2. **The live exit rules are leaving money on the table on every asset.** Holding to
+   settlement earns 1.3–3.1× more than the take-profit/stop-loss rules. A +15% target is
+   premature for an instrument whose range is $0.00–$1.00.
+
+### Were the entry prices fillable?
+
+Settlement win rates come from the tape's `resolvedUp` field, so they are independent of
+the Binance spot proxy. The entry *price* is not. A cluster at the 5th percentile (0.030 on
+BTC) would suggest entries filling at prices that never existed. `scripts/diag-entry-fills.ts`
+checks this:
+
+```
+entry price p05=0.030 p25=0.110 p50=0.260 p75=0.380 p95=0.470
+exact-price repeats <= 2 in round : 24/81
+last print older than 10s at entry:  2/81
+```
+
+**Only 2 of 81 entries have a stale last print**, and 30% show several prints at the same
+price. The entry prices were genuinely available in the tape — the mispricing is not a
+stale-print artefact. What this still cannot confirm is **depth**: 20 of 81 BTC entries sit
+at or below 0.05, where $20 notional needs 1,795 shares. Orderbook depth is unavailable
+historically, so whether those sizes would fill remains unverified.
+
+---
+
+## 3e. Chainlink TWAP vs Binance spot
+
+The settlement reference is Chainlink's BTC/USD 60s TWAP (`resolutionSource`), and the
+markets state explicitly that resolution is *"not according to any other sources or spot
+markets"*. The backtest feeds `momentum` Binance 1s spot instead.
+
+Chainlink's Data Streams endpoint requires credentials and rate-limits unauthenticated
+requests (429), so the stream could not be read directly. Two independent checks were used
+instead:
+
+- **Binance data integrity**: 1,000 consecutive seconds with **zero timestamp gaps**.
+- **Cross-venue spread**: at one sampled second, Binance closed at 77,123.25 and Bybit at
+  77,135.50 — a 12.25-point (0.016%) difference. So "the spot price" is not a single number,
+  and Chainlink's aggregate sits inside that spread.
+- **Outcome agreement**: the 30.9–34.8% settlement win rate is measured against the tape's
+  own resolution field, so it does not depend on the proxy at all. The proxy affects only
+  *which* instants fire the signal, not whether the trades won.
+
+**Conclusion: the proxy could not be validated directly, but it is not load-bearing for the
+headline result.** The mispricing finding survives without it; only the precise entry
+timing depends on Binance matching the oracle's view of the 30s move.
+
+
 
 
 ### Result — BTC 15m, 24 rounds / 5.8 hours / $1.2M round volume
