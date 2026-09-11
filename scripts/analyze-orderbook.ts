@@ -98,8 +98,18 @@ async function main() {
     console.error(`Start the recorder:  npx tsx scripts/observe-orderbook.ts --assets "${asset}" --duration ${duration}`);
     process.exit(2);
   }
-  const ageMin = (books[books.length - 1].ts - books[0].ts) / 60000;
-  console.log(`observation window: ${ageMin.toFixed(1)} minutes`);
+  const spanMs = books[books.length - 1].ts * 1000 - books[0].ts * 1000;
+  const spanMin = spanMs / 60000;
+  console.log(
+    `observation window: ${spanMin.toFixed(1)} minutes  ` +
+      `(${new Date(books[0].ts * 1000).toISOString().slice(11, 16)} .. ` +
+      `${new Date(books[books.length - 1].ts * 1000).toISOString().slice(11, 16)} UTC)`
+  );
+  if (spanMin < 2) {
+    console.log(`\n  Only ${spanMin.toFixed(1)} min recorded. The recorder needs to run for a`);
+    console.log(`  while before there is enough to join. This exits rather than guess.`);
+    return;
+  }
 
   // Index books by slug+side for O(1) nearest lookup.
   const bySlugSide = new Map<string, BookObs[]>();
@@ -145,13 +155,22 @@ async function main() {
   }
   all.sort((a, b) => a.startSec - b.startSec);
 
-  // Only rounds covered by the observation window.
-  const first = books[0].ts;
-  const last = books[books.length - 1].ts;
+  // Rounds that OVERLAP the observation window.
+  //
+  // Requiring a round to sit entirely inside the window is impossible whenever the
+  // window is shorter than one round (a 15-minute round can never fit inside a
+  // 6-minute recording), which made this silently analyse nothing. Overlap is the
+  // correct test; the per-entry join still requires an observation within
+  // `tolSec` of the entry, so partial coverage cannot fabricate a match.
+  const firstMs = books[0].ts * 1000;
+  const lastMs = books[books.length - 1].ts * 1000;
   const rounds = all.filter(
-    (r) => r.startSec >= first - 60 && r.endSec <= last + 60 && r.up.length + r.down.length >= 20
+    (r) =>
+      r.endSec * 1000 >= firstMs &&
+      r.startSec * 1000 <= lastMs &&
+      r.up.length + r.down.length >= 20
   );
-  console.log(`tape rounds inside that window: ${rounds.length}`);
+  console.log(`tape rounds overlapping that window: ${rounds.length}`);
 
   if (rounds.length === 0) {
     console.log(`\nNo overlapping rounds yet. Let the recorder run longer, then re-run.`);
