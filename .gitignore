@@ -94,3 +94,8 @@ src/api/
 # backtest tape/spot caches (large, regenerable via scripts/crypto-hft-backfill.ts)
 .cache/
 
+
+# order-book observation records (large, regenerable)
+.cache/orderbook/
+.cache/crypto-hft-live/
+
