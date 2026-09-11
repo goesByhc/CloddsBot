@@ -268,8 +268,47 @@ async function main() {
   let skippedThin = 0;
   let failed = 0;
   let kept = 0;
+  let appendErrors = 0;
   const startedAt = Date.now();
   let cursor = 0;
+
+  /**
+   * Records are buffered and flushed by a single writer.
+   *
+   * Two problems made direct per-worker appends unreliable:
+   *   - concurrent appendFileSync from N workers races on the same fd;
+   *   - any transient EBUSY (e.g. a backup or a reader holding the file) crashed
+   *     the whole run. A 60-day BTC backfill died at round 74/5760 that way.
+   * Now a failed write is retried, then counted, and never aborts the run; the
+   * records stay buffered and are flushed at the end.
+   */
+  const pending: string[] = [];
+  let flushing = false;
+
+  function scheduleFlush(): void {
+    if (flushing) return;
+    flushing = true;
+    setImmediate(() => {
+      flushing = false;
+      if (pending.length === 0) return;
+      const batch = pending.join('');
+      pending.length = 0;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          appendFileSync(path, batch);
+          return;
+        } catch {
+          appendErrors++;
+          // Busy-wait a moment and retry; re-queue on final failure.
+          const until = Date.now() + 150 * (attempt + 1);
+          while (Date.now() < until) {
+            /* small synchronous backoff */
+          }
+        }
+      }
+      pending.unshift(batch);
+    });
+  }
 
   async function worker(): Promise<void> {
     for (;;) {
@@ -283,7 +322,12 @@ async function main() {
         continue;
       }
 
-      const tape = await fetchRoundTape(asset, duration, roundDurationSec, startSec);
+      let tape: RoundTape | null = null;
+      try {
+        tape = await fetchRoundTape(asset, duration, roundDurationSec, startSec);
+      } catch {
+        tape = null;
+      }
       fetched++;
 
       if (!tape) {
@@ -292,8 +336,9 @@ async function main() {
         skippedThin++;
       } else {
         cache.set(slug, tape);
-        // Append immediately so an interrupted run keeps its progress.
-        appendFileSync(path, JSON.stringify(tape) + '\n');
+        // Queue for the single writer so progress survives an interruption.
+        pending.push(JSON.stringify(tape) + '\n');
+        scheduleFlush();
         kept++;
       }
 
@@ -303,13 +348,31 @@ async function main() {
         const etaMin = (slots.length - idx) / Math.max(rate, 0.001) / 60;
         process.stdout.write(
           `\r  ${idx + 1}/${slots.length}  kept ${kept}  thin ${skippedThin}  empty ${failed}  ` +
-            `${rate.toFixed(1)}/s  eta ${etaMin.toFixed(1)}m   `
+            `${rate.toFixed(1)}/s  eta ${etaMin.toFixed(1)}m  buffered ${pending.length}   `
         );
       }
     }
   }
 
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  // Final flush, retrying harder than the incremental path.
+  if (pending.length > 0) {
+    const batch = pending.join('');
+    pending.length = 0;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try {
+        appendFileSync(path, batch);
+        break;
+      } catch {
+        appendErrors++;
+        const until = Date.now() + 250 * (attempt + 1);
+        while (Date.now() < until) {
+          /* backoff */
+        }
+      }
+    }
+  }
 
   const elapsed = (Date.now() - startedAt) / 1000;
   const tapes = Array.from(cache.values());
@@ -334,6 +397,12 @@ async function main() {
     );
   }
   console.log(`\nCache file: ${path}`);
+  if (appendErrors > 0) {
+    console.log(
+      `  NOTE: ${appendErrors} transient append error(s) were retried. Verify the cache\n` +
+        `  round count above matches expectations before trusting a backtest.`
+    );
+  }
 }
 
 main().catch((e) => {

@@ -184,6 +184,69 @@ buffer, all fixed and documented in `backtest.ts`:
    silently shrank every window. `scripts/verify-buffer-equiv.ts` pins the optimised buffer
    against a reference implementation over 40,000 values and reports IDENTICAL.
 
+---
+
+## 3c. Sample expansion and cross-validation
+
+Three follow-ups: grow the `momentum` sample, cross-check on other assets, and test whether
+`expiry_fade` is mistuned or simply edgeless.
+
+Data now collected (all tick-level via `data-api.polymarket.com/trades`):
+
+| Asset | Rounds | Prints | Avg/round | Window | Round volume |
+|---|---|---|---|---|---|
+| BTC 15m | 5,677 | 5,662,584 | 997 | 60 days | — |
+| ETH 15m | 1,292 | 387,111 | 300 | 14 days | — |
+| SOL 15m | 1,289 | 133,975 | 104 | 14 days | — |
+
+### Cross-asset result
+
+| Asset | Strategy | Trades | Win% | Net $ | $/trade | Fees |
+|---|---|---|---|---|---|---|
+| BTC 60d | **momentum** | 26 | 76.9% | **+13.16** | **+0.506** | 6.77 |
+| ETH 14d | **momentum** | 131 | 72.5% | **+19.71** | **+0.150** | 31.16 |
+| SOL 14d | **momentum** | 256 | 74.6% | **+156.22** | **+0.610** | 64.02 |
+| BTC 60d | expiry_fade | 5,641 | 33.0% | −1,489.53 | −0.264 | 978.56 |
+| ETH 14d | expiry_fade | 1,266 | 35.0% | −256.37 | −0.203 | 208.01 |
+| SOL 14d | expiry_fade | 1,235 | 29.8% | −600.01 | −0.486 | 208.17 |
+| BTC 60d | mean_reversion | 5,653 | 39.0% | −373.36 | −0.066 | 0 |
+| ETH 14d | mean_reversion | 1,287 | 39.1% | −66.21 | −0.051 | 0 |
+| SOL 14d | mean_reversion | 1,286 | 36.9% | −251.58 | −0.196 | 0 |
+
+**`momentum` is the only strategy profitable on every asset, with a 72–77% win rate.**
+The consistency of the win rate across three assets and two sample sizes (26 and 256 trades)
+is the strongest signal found so far — it is not a single-sample artefact.
+
+**`expiry_fade` loses on all three, and loses before fees on all three.** It is not an
+asset-specific problem.
+
+**`mean_reversion` is the instructive failure.** On the 7-day BTC sample it showed +$0.034
+per trade and looked viable. Over 60 days it is −$0.066 per trade. The 7-day result was
+noise, and only the larger sample revealed it.
+
+### Threshold sweep: mistuned or edgeless?
+
+`scripts/crypto-hft-sweep.ts` re-runs each strategy across entry thresholds.
+
+**`expiry_fade` — edgeless, not mistuned.** On 5,677 BTC rounds, 13 settings were tested;
+the best *per-trade* result of any setting is −$0.223 (skew 0.30 + minSecLeft 240), against
+a baseline of −$0.264. Tightening reduces the trade count rather than improving the average.
+The same verdict holds on ETH (−0.217 best vs −0.221 baseline) and SOL (−0.458 vs −0.499).
+**No threshold makes it positive. It should be disabled, not retuned.**
+
+**`momentum` — the discovery is that its gate is too tight.**
+Relaxing `minSpotMovePct` from 0.15 to **0.10** raises the sample from 26 to **82 trades**
+while the win rate *rises* to **84.1%**, keeping +$0.367/trade. That is a 3× larger sample
+on the same 60 days, still profitable after fees. The live default is therefore discarding
+most of the edge.
+
+Also worth noting: `maxPolyStaleSec` (2/10/20) changes nothing — prints are dense enough
+that the staleness gate never binds.
+
+**`mean_reversion` — no setting works.** All 10 variants are negative; the least-bad
+(`expensiveThreshold` 0.85) is −$0.028/trade.
+
+
 
 ### Result — BTC 15m, 24 rounds / 5.8 hours / $1.2M round volume
 

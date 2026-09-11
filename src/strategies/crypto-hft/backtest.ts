@@ -1020,6 +1020,16 @@ export interface TickBacktestOptions extends BacktestConfig {
    * executions; the residual optimism is that size/queue impact is not modelled.
    */
   trustPrintAsFill?: boolean;
+  /**
+   * Override the strategy's entry thresholds. Used to test whether a losing
+   * strategy is losing because its trigger is too permissive, which is a
+   * different diagnosis from "the edge does not exist".
+   */
+  strategyCfg?: {
+    expiryFade?: Partial<ExpiryFadeCfg>;
+    meanReversion?: Partial<MeanReversionCfg>;
+    momentum?: Partial<MomentumCfg>;
+  };
 }
 
 /**
@@ -1126,34 +1136,43 @@ function replayTickRound(
     if (strategy === 'momentum') {
       if (lastSpot === null) continue;
       const spotMovePct = spotBuf.movePct(30, nowMs);
-      const sig = evaluateMomentumPure({
-        upPrice: up,
-        downPrice: down,
-        spotMovePct,
-        polyAgeSec,
-        spotWindowSec: 30,
-      });
+      const sig = evaluateMomentumPure(
+        {
+          upPrice: up,
+          downPrice: down,
+          spotMovePct,
+          polyAgeSec,
+          spotWindowSec: 30,
+        },
+        { ...DEFAULT_MOMENTUM, ...opts.strategyCfg?.momentum }
+      );
       if (!sig) continue;
       open = openFrom(sig, nowSec, roundAgeSec, opts);
     } else if (strategy === 'mean_reversion') {
       const spotMovePct = spotBuf.count() >= 2 ? spotBuf.movePct(60, nowMs) : 0;
-      const sig = evaluateMeanReversionPure({
-        upPrice: up,
-        downPrice: down,
-        roundAgeSec,
-        spotMovePct,
-      });
+      const sig = evaluateMeanReversionPure(
+        {
+          upPrice: up,
+          downPrice: down,
+          roundAgeSec,
+          spotMovePct,
+        },
+        { ...DEFAULT_MR, ...opts.strategyCfg?.meanReversion }
+      );
       if (!sig) continue;
       open = openFrom(sig, nowSec, roundAgeSec, opts);
     } else {
       const spotMovePct = spotBuf.count() >= 2 ? spotBuf.movePct(60, nowMs) : 0;
-      const sig = evaluateExpiryFadePure({
-        upPrice: up,
-        downPrice: down,
-        expiresAtMs: round.endSec * 1000,
-        nowMs,
-        spotMovePct,
-      });
+      const sig = evaluateExpiryFadePure(
+        {
+          upPrice: up,
+          downPrice: down,
+          expiresAtMs: round.endSec * 1000,
+          nowMs,
+          spotMovePct,
+        },
+        { ...DEFAULT_EXPIRY_FADE, ...opts.strategyCfg?.expiryFade }
+      );
       if (!sig) continue;
       open = openFrom(sig, nowSec, roundAgeSec, opts);
     }
