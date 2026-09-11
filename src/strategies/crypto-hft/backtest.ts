@@ -219,60 +219,112 @@ export interface PurePriceBuffer {
   count(): number;
 }
 
-/** Same semantics as `createPriceBuffer`, but every window takes an explicit `now`. */
+/**
+ * Same semantics as `createPriceBuffer`, but every window takes an explicit `now`.
+ *
+ * Two performance problems had to be solved to make a 672-round tick replay
+ * feasible; the live implementation is fine live but quadratic over ~650k prints:
+ *
+ *  1. `unshift()` memmoves the whole array per tick. Points are therefore stored
+ *     ASCENDING and appended with `push()`.
+ *  2. Windows were rebuilt with `Array.filter` and `Math.max(...map)` on every
+ *     call, scanning ~2000 entries several times per tick. Window bounds are now
+ *     found by binary search over the ascending timestamps, so only the window's
+ *     own points are scanned.
+ *
+ * RETENTION SEMANTICS ARE PRESERVED. The live `prune()` applies two rules in
+ * order: drop older than maxAgeSec, then truncate to 2000 entries. The second
+ * rule is a FLOOR, not a ceiling, because at ~1.5s print spacing 180s holds only
+ * ~120 points, so a 30/60/120s window is always fully inside what is retained.
+ * Keeping `maxAgeSec` of history here is therefore behaviourally identical for
+ * every window the strategies use, verified against a reference implementation
+ * over 40k values by scripts/verify-buffer-equiv.ts.
+ */
 export function createPurePriceBuffer(maxAgeSec = 180): PurePriceBuffer {
-  // newest first, mirroring the live implementation
+  // ascending in time (oldest first); [start, length) is the live range
   const prices: PricePoint[] = [];
+  let start = 0;
 
-  function prune(now: number) {
+  function advance(now: number) {
     const cutoff = now - maxAgeSec * 1000;
-    while (prices.length > 0 && prices[prices.length - 1].t < cutoff) prices.pop();
-    if (prices.length > 2000) prices.length = 2000;
+    while (start < prices.length && prices[start].t < cutoff) start++;
+    if (start > 8192 && start * 2 > prices.length) {
+      prices.splice(0, start);
+      start = 0;
+    }
   }
 
-  function inWindow(windowSec: number, now: number): PricePoint[] {
-    const cutoff = now - windowSec * 1000;
-    return prices.filter((p) => p.t >= cutoff);
+  /** Index of the first live entry with t >= cutoff, or prices.length. */
+  function lowerBound(cutoff: number): number {
+    let lo = start;
+    let hi = prices.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (prices[mid].t < cutoff) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
   }
 
   return {
     push(price, ts) {
-      prices.unshift({ t: ts, p: price });
-      prune(ts);
+      prices.push({ t: ts, p: price });
+      advance(ts);
     },
     reversals(windowSec, minStep, now) {
-      const w = inWindow(windowSec, now);
-      if (w.length < 3) return 0;
+      advance(now);
+      const lo = lowerBound(now - windowSec * 1000);
+      const n = prices.length - lo;
+      if (n < 3) return 0;
+      // Walk newest -> oldest, comparing consecutive pairs so the direction
+      // sequence matches the live implementation.
       let count = 0;
       let lastDir: 'up' | 'down' | null = null;
-      for (let i = 1; i < w.length; i++) {
-        const diff = w[i - 1].p - w[i].p;
-        if (Math.abs(diff) < minStep) continue;
-        const dir = diff > 0 ? 'up' : 'down';
-        if (lastDir && dir !== lastDir) count++;
-        lastDir = dir;
+      let newerP = prices[prices.length - 1].p;
+      for (let i = prices.length - 2; i >= lo; i--) {
+        const diff = newerP - prices[i].p; // newer minus older
+        if (Math.abs(diff) >= minStep) {
+          const dir: 'up' | 'down' = diff > 0 ? 'up' : 'down';
+          if (lastDir && dir !== lastDir) count++;
+          lastDir = dir;
+        }
+        newerP = prices[i].p;
       }
       return count;
     },
     range(windowSec, now) {
-      const w = inWindow(windowSec, now);
-      if (w.length === 0) return 0;
-      return Math.max(...w.map((x) => x.p)) - Math.min(...w.map((x) => x.p));
+      advance(now);
+      const lo = lowerBound(now - windowSec * 1000);
+      if (lo >= prices.length) return 0;
+      let min = Infinity;
+      let max = -Infinity;
+      for (let i = lo; i < prices.length; i++) {
+        const v = prices[i].p;
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+      return max - min;
     },
     mean(windowSec, now) {
-      const w = inWindow(windowSec, now);
-      if (w.length === 0) return 0;
-      return w.reduce((s, x) => s + x.p, 0) / w.length;
+      advance(now);
+      const lo = lowerBound(now - windowSec * 1000);
+      if (lo >= prices.length) return 0;
+      let sum = 0;
+      for (let i = lo; i < prices.length; i++) sum += prices[i].p;
+      return sum / (prices.length - lo);
     },
     movePct(windowSec, now) {
-      const w = inWindow(windowSec, now);
-      if (w.length < 2) return 0;
-      const newest = w[0].p;
-      const oldest = w[w.length - 1].p;
+      advance(now);
+      const lo = lowerBound(now - windowSec * 1000);
+      if (prices.length - lo < 2) return 0;
+      const newest = prices[prices.length - 1].p;
+      const oldest = prices[lo].p;
       if (oldest === 0) return 0;
       return ((newest - oldest) / oldest) * 100;
     },
-    count: () => prices.length,
+    count() {
+      return prices.length - start;
+    },
   };
 }
 
@@ -282,8 +334,10 @@ export function createPurePriceBuffer(maxAgeSec = 180): PurePriceBuffer {
 
 export type Direction = 'up' | 'down';
 
+export type StrategyName = 'mean_reversion' | 'expiry_fade' | 'momentum';
+
 export interface Signal {
-  strategy: 'mean_reversion' | 'expiry_fade';
+  strategy: StrategyName;
   direction: Direction;
   entryPrice: number;
   confidence: number;
@@ -368,6 +422,63 @@ export const DEFAULT_EXPIRY_FADE: ExpiryFadeCfg = {
   maxRecentSpotMovePct: 0.06,
 };
 
+export interface MomentumCfg {
+  minSpotMovePct: number;
+  maxPolyStaleSec: number;
+  minLagCents: number;
+  spotWindowSec: number;
+}
+
+export const DEFAULT_MOMENTUM: MomentumCfg = {
+  minSpotMovePct: 0.15,
+  maxPolyStaleSec: 5,
+  minLagCents: 0.02,
+  spotWindowSec: 30,
+};
+
+/**
+ * Port of `evaluateMomentum` (strategies.ts:131).
+ *
+ * The spread gate (`book.spreadPct > maxSpreadPct`) is omitted because tick data
+ * carries traded prices, not quotes — a spread cannot be derived from prints.
+ * Callers must surface that as a tier note.
+ */
+export function evaluateMomentumPure(
+  input: {
+    upPrice: number;
+    downPrice: number;
+    /** spot move over `spotWindowSec`, in percent, signed */
+    spotMovePct: number;
+    /** seconds since the last observed print on the traded side */
+    polyAgeSec: number;
+    spotWindowSec: number;
+  },
+  cfg: MomentumCfg = DEFAULT_MOMENTUM
+): Signal | null {
+  const { upPrice, downPrice, spotMovePct, polyAgeSec, spotWindowSec } = input;
+  if (Math.abs(spotMovePct) < cfg.minSpotMovePct) return null;
+  if (polyAgeSec > cfg.maxPolyStaleSec) return null;
+
+  const direction: Direction = spotMovePct > 0 ? 'up' : 'down';
+  const price = direction === 'up' ? upPrice : downPrice;
+
+  // The live fairness heuristic: a 0.15% spot move maps to ~5c of binary price.
+  const expectedPolyPrice = 0.5 + (Math.abs(spotMovePct) / 100) * 5;
+  const lagCents = expectedPolyPrice - price;
+  if (lagCents < cfg.minLagCents) return null;
+
+  return {
+    strategy: 'momentum',
+    direction,
+    entryPrice: price,
+    confidence: Math.min(1, Math.abs(spotMovePct) / 0.3),
+    // 'maker_then_taker' in the live config; charged as taker here because with
+    // no quote data a maker fill cannot be assumed (see tier notes).
+    orderMode: 'taker',
+    reason: `spot ${spotMovePct > 0 ? '+' : ''}${spotMovePct.toFixed(3)}% / ${spotWindowSec}s, lag ${(lagCents * 100).toFixed(1)}c`,
+  };
+}
+
 /** Port of `evaluateExpiryFade` (strategies.ts:402). `now` is explicit. */
 export function evaluateExpiryFadePure(
   input: {
@@ -449,7 +560,7 @@ export const DEFAULT_BT_CONFIG: BacktestConfig = {
 
 export interface SimTrade {
   roundSlug: string;
-  strategy: Signal['strategy'];
+  strategy: StrategyName;
   direction: Direction;
   entryT: number;
   entryPrice: number;
@@ -469,7 +580,7 @@ export interface SimTrade {
 }
 
 export interface BacktestResult {
-  strategy: Signal['strategy'];
+  strategy: StrategyName;
   tier: StrategyTier;
   notes: string[];
   roundsConsidered: number;
@@ -496,7 +607,7 @@ export interface BacktestResult {
 /** Entry evaluation happens on each available data point inside the round. */
 function replayRound(
   round: HistoricalRound,
-  strategy: Signal['strategy'],
+  strategy: StrategyName,
   cfg: BacktestConfig
 ): SimTrade | null {
   const upBuf = createPurePriceBuffer();
@@ -516,7 +627,7 @@ function replayRound(
   let lastDown = round.downSeries[0]?.p ?? 0.5;
 
   let open: {
-    strategy: Signal['strategy'];
+    strategy: StrategyName;
     entryT: number;
     entryPrice: number;
     shares: number;
@@ -624,8 +735,8 @@ function replayRound(
 }
 
 function closeTrade(
-  round: HistoricalRound,
-  open: { strategy: Signal['strategy']; entryT: number; entryPrice: number; shares: number; direction: Direction; orderMode: Signal['orderMode']; roundAgeSec: number },
+  round: { slug: string; startSec: number },
+  open: { strategy: StrategyName; entryT: number; entryPrice: number; shares: number; direction: Direction; orderMode: Signal['orderMode']; roundAgeSec: number },
   args: { exitT: number; exitPrice: number; exitReason: SimTrade['exitReason']; cfg: BacktestConfig }
 ): SimTrade {
   const { cfg } = args;
@@ -664,7 +775,7 @@ function closeTrade(
 
 export function backtestStrategy(
   rounds: HistoricalRound[],
-  strategy: Signal['strategy'],
+  strategy: StrategyName,
   cfg: BacktestConfig = DEFAULT_BT_CONFIG
 ): BacktestResult {
   const notes: string[] = [];
@@ -766,4 +877,451 @@ export function formatBacktestReport(results: BacktestResult[]): string {
     for (const n of r.notes) lines.push(`  note: ${n}`);
   }
   return lines.join('\n');
+}
+
+// =============================================================================
+// TICK-LEVEL REPLAY (higher fidelity than the minute-bar path above)
+// =============================================================================
+
+export interface TickPoint {
+  /** unix seconds */
+  t: number;
+  /** price in [0,1] */
+  p: number;
+  /** shares */
+  s: number;
+  side: 'BUY' | 'SELL';
+}
+
+/** One round's trade tape, as produced by scripts/crypto-hft-backfill.ts. */
+export interface TickRound {
+  slug: string;
+  asset: string;
+  startSec: number;
+  endSec: number;
+  up: TickPoint[];
+  down: TickPoint[];
+  resolvedUp: number | null;
+  volumeUsd: number;
+}
+
+export interface SpotPoint {
+  /** unix seconds */
+  t: number;
+  /** price in quote currency */
+  p: number;
+}
+
+/**
+ * Cached wrapper around `fetchSpotSeries`.
+ *
+ * A 7-day window at 1s granularity is ~600k points and Binance serves 1000 per
+ * request, so a cold fetch is ~600 sequential HTTP calls (the first attempt at
+ * this timed out past 10 minutes). Caching makes that a one-time cost.
+ */
+export async function loadSpotSeries(
+  symbol: string,
+  startSec: number,
+  endSec: number,
+  cacheDir: string,
+  onProgress?: (points: number) => void
+): Promise<SpotPoint[]> {
+  const { existsSync, mkdirSync, readFileSync, writeFileSync } = await import('fs');
+  const { join } = await import('path');
+  if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
+  const path = join(cacheDir, `spot-${symbol}-${startSec}-${endSec}.json`);
+
+  if (existsSync(path)) {
+    try {
+      const cached = JSON.parse(readFileSync(path, 'utf8')) as SpotPoint[];
+      if (Array.isArray(cached) && cached.length > 0) {
+        onProgress?.(cached.length);
+        return cached;
+      }
+    } catch {
+      /* fall through and refetch */
+    }
+  }
+
+  const series = await fetchSpotSeries(symbol, startSec, endSec, onProgress);
+  if (series.length > 0) {
+    try {
+      writeFileSync(path, JSON.stringify(series));
+    } catch {
+      /* cache write is best-effort */
+    }
+  }
+  return series;
+}
+
+/**
+ * Fetch 1-second spot klines from Binance's public API (no key required).
+ *
+ * This exists because `momentum` is gated on a 30s spot move, and the settlement
+ * reference (Chainlink TWAP) is not historically free. Binance spot is a proxy:
+ * it correlates near-perfectly over 30s windows but is NOT the same series, so
+ * momentum results carry that caveat.
+ */
+export async function fetchSpotSeries(
+  symbol: string,
+  startSec: number,
+  endSec: number,
+  onProgress?: (points: number, total: number) => void
+): Promise<SpotPoint[]> {
+  const out: SpotPoint[] = [];
+  const limit = 1000;
+  let cursor = startSec * 1000;
+  const endMs = endSec * 1000;
+  let calls = 0;
+  // Binance caps limit at 1000, so walk forward.
+  while (cursor < endMs) {
+    const url =
+      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1s` +
+      `&startTime=${cursor}&limit=${limit}`;
+    let batch: unknown[] | null = null;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+      if (res.status === 429) {
+        // Rate limited —back off and retry the same window.
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+      if (!res.ok) break;
+      batch = (await res.json()) as unknown[];
+    } catch {
+      break;
+    }
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    for (const row of batch) {
+      const k = row as [number, string, string, string, string];
+      const t = Math.floor(Number(k[0]) / 1000);
+      const close = Number(k[4]);
+      if (Number.isFinite(t) && Number.isFinite(close)) out.push({ t, p: close });
+    }
+    const last = out[out.length - 1];
+    if (!last) break;
+    cursor = (last.t + 1) * 1000;
+    calls++;
+    if (calls % 25 === 0) onProgress?.(out.length, Math.ceil((endMs - startSec * 1000) / 1000));
+    if (batch.length < limit) break;
+    // Guard against a pathological loop if the API keeps returning the same page.
+    if (calls > 5000) break;
+  }
+  return out;
+}
+
+export interface TickBacktestOptions extends BacktestConfig {
+  /** strategy to replay */
+  strategy: StrategyName;
+  /** 1-second spot series; required for momentum, ignored otherwise */
+  spot?: SpotPoint[];
+  /**
+   * Treat the traded print as the fill price. True reflects that prints are real
+   * executions; the residual optimism is that size/queue impact is not modelled.
+   */
+  trustPrintAsFill?: boolean;
+}
+
+/**
+ * Replay one round against its trade tape.
+ *
+ * Evaluation clock is the union of both sides' trade timestamps, so a signal is
+ * only considered at an instant when at least one side actually printed. Prices
+ * carry forward from the last print — which is exactly why `polyAgeSec` is
+ * meaningful here, and why slots left open longer than `maxPolyStaleSec` are
+ * skipped the way the live engine would skip them.
+ */
+function replayTickRound(
+  round: TickRound,
+  opts: TickBacktestOptions,
+  spotIndex: { times: number[]; prices: number[] }
+): SimTrade | null {
+  const { strategy } = opts;
+  const upBuf = createPurePriceBuffer();
+  const downBuf = createPurePriceBuffer();
+  const spotBuf = createPurePriceBuffer(600);
+
+  const times = Array.from(
+    new Set([...round.up.map((x) => x.t), ...round.down.map((x) => x.t)])
+  ).sort((a, b) => a - b);
+  if (times.length < 3) return null;
+
+  const upAt = new Map(round.up.map((x) => [x.t, x]));
+  const downAt = new Map(round.down.map((x) => [x.t, x]));
+
+  // Spot is one global sorted series. Feed it with a cursor instead of building a
+  // Map per round: rebuilding a 605k-entry Map for each of 672 rounds was the
+  // dominant cost of the first tick run (it did not finish in 20 minutes).
+  const spotLen = spotIndex.times.length;
+  let scan = 0;
+  while (scan < spotLen && spotIndex.times[scan] < round.startSec) scan++;
+
+  let lastUp = round.up[0]?.p ?? 0.5;
+  let lastDown = round.down[0]?.p ?? 0.5;
+  let lastSpot: number | null = null;
+  let lastUpT = round.up[0]?.t ?? round.startSec;
+  let lastDownT = round.down[0]?.t ?? round.startSec;
+
+  let open: {
+    strategy: StrategyName;
+    entryT: number;
+    entryPrice: number;
+    shares: number;
+    direction: Direction;
+    orderMode: Signal['orderMode'];
+    roundAgeSec: number;
+  } | null = null;
+
+  for (const t of times) {
+    const nowMs = t * 1000;
+    const nowSec = t;
+    const upTick = upAt.get(t);
+    const downTick = downAt.get(t);
+    const up = upTick ? upTick.p : lastUp;
+    const down = downTick ? downTick.p : lastDown;
+    if (upTick) lastUpT = t;
+    if (downTick) lastDownT = t;
+    lastUp = up;
+    lastDown = down;
+
+    // Advance the spot cursor up to this instant, in order.
+    while (scan < spotLen && spotIndex.times[scan] <= nowSec) {
+      lastSpot = spotIndex.prices[scan];
+      spotBuf.push(lastSpot, spotIndex.times[scan] * 1000);
+      scan++;
+    }
+
+    upBuf.push(up, nowMs);
+    downBuf.push(down, nowMs);
+
+    const roundAgeSec = nowSec - round.startSec;
+    const timeLeftSec = round.endSec - nowSec;
+
+    // ── exits first, matching the live engine's ordering ──
+    if (open) {
+      const cur = open.direction === 'up' ? up : down;
+      const grossPct = ((cur - open.entryPrice) / open.entryPrice) * 100;
+      let exitReason: SimTrade['exitReason'] | null = null;
+      if (grossPct >= opts.takeProfitPct) exitReason = 'take_profit';
+      else if (grossPct <= -opts.stopLossPct) exitReason = 'stop_loss';
+      else if (timeLeftSec <= opts.forceExitSec) exitReason = 'force_exit';
+      if (exitReason) {
+        return closeTrade(round, open, {
+          exitT: nowSec,
+          exitPrice: cur,
+          exitReason,
+          cfg: opts,
+        });
+      }
+    }
+
+    // ── entries ──
+    if (open) continue;
+    if (roundAgeSec < 30) continue;
+    if (timeLeftSec < opts.minTimeLeftSec) continue;
+
+    // Which side printed most recently drives the staleness gate.
+    const polyAgeSec = Math.max(0, nowSec - Math.max(lastUpT, lastDownT));
+
+    if (strategy === 'momentum') {
+      if (lastSpot === null) continue;
+      const spotMovePct = spotBuf.movePct(30, nowMs);
+      const sig = evaluateMomentumPure({
+        upPrice: up,
+        downPrice: down,
+        spotMovePct,
+        polyAgeSec,
+        spotWindowSec: 30,
+      });
+      if (!sig) continue;
+      open = openFrom(sig, nowSec, roundAgeSec, opts);
+    } else if (strategy === 'mean_reversion') {
+      const spotMovePct = spotBuf.count() >= 2 ? spotBuf.movePct(60, nowMs) : 0;
+      const sig = evaluateMeanReversionPure({
+        upPrice: up,
+        downPrice: down,
+        roundAgeSec,
+        spotMovePct,
+      });
+      if (!sig) continue;
+      open = openFrom(sig, nowSec, roundAgeSec, opts);
+    } else {
+      const spotMovePct = spotBuf.count() >= 2 ? spotBuf.movePct(60, nowMs) : 0;
+      const sig = evaluateExpiryFadePure({
+        upPrice: up,
+        downPrice: down,
+        expiresAtMs: round.endSec * 1000,
+        nowMs,
+        spotMovePct,
+      });
+      if (!sig) continue;
+      open = openFrom(sig, nowSec, roundAgeSec, opts);
+    }
+  }
+
+  if (open) {
+    const upWon = round.resolvedUp !== null && round.resolvedUp >= 0.5;
+    const settlePrice =
+      round.resolvedUp === null
+        ? open.direction === 'up'
+          ? lastUp
+          : lastDown
+        : open.direction === 'up'
+          ? upWon
+            ? 1
+            : 0
+          : upWon
+            ? 0
+            : 1;
+    return closeTrade(round, open, {
+      exitT: round.endSec,
+      exitPrice: settlePrice,
+      exitReason: round.resolvedUp === null ? 'round_end' : 'resolution',
+      cfg: opts,
+    });
+  }
+  return null;
+}
+
+function openFrom(
+  sig: Signal,
+  nowSec: number,
+  roundAgeSec: number,
+  opts: BacktestConfig
+): {
+  strategy: StrategyName;
+  entryT: number;
+  entryPrice: number;
+  shares: number;
+  direction: Direction;
+  orderMode: Signal['orderMode'];
+  roundAgeSec: number;
+} {
+  const rawShares = Math.floor((opts.sizeUsd / sig.entryPrice) * 100) / 100;
+  const shares = Math.min(Math.max(rawShares, opts.minShares), opts.maxShares);
+  const entryPrice =
+    sig.orderMode === 'taker'
+      ? Math.min(0.99, sig.entryPrice + opts.takerBufferCents / 100)
+      : sig.entryPrice;
+  return {
+    strategy: sig.strategy,
+    entryT: nowSec,
+    entryPrice,
+    shares,
+    direction: sig.direction,
+    orderMode: sig.orderMode,
+    roundAgeSec,
+  };
+}
+
+export function backtestFromTicks(
+  rounds: TickRound[],
+  opts: TickBacktestOptions
+): BacktestResult {
+  const notes: string[] = [];
+  const strategy = opts.strategy;
+
+  notes.push(
+    'Evaluation clock = union of both sides\' trade prints; prices carry forward between prints.'
+  );
+  notes.push(
+    'Fill price = the traded print at evaluation time. No orderbook depth, so size impact and queue position are not modelled.'
+  );
+
+  if (strategy === 'momentum') {
+    if (!opts.spot || opts.spot.length === 0) {
+      return {
+        strategy,
+        tier: 'not_testable',
+        notes: [
+          ...notes,
+          'momentum requires a spot series (--spot binance:BTCUSDT); none supplied.',
+        ],
+        roundsConsidered: rounds.length,
+        roundsWithData: 0,
+        trades: [],
+        metrics: emptyMetrics(),
+      };
+    }
+    notes.push(
+      'Spread gate (book.spreadPct <= 2.0) NOT applied \u2014 prints carry no quotes, so a spread cannot be derived.'
+    );
+    notes.push(
+      'Spot = Binance 1s spot, a PROXY for the Chainlink TWAP these markets settle on. Same 30s windows are highly correlated but not identical.'
+    );
+    notes.push(
+      'Live orderMode is maker_then_taker; charged as taker here because maker fills cannot be assumed without queue data.'
+    );
+  } else if (strategy === 'mean_reversion') {
+    notes.push('OBI gate NOT applied \u2014 order-flow imbalance needs quotes, not prints.');
+  } else {
+    notes.push('spreadPct gate NOT applied \u2014 prints carry no quotes.');
+  }
+
+  const usable = rounds.filter((r) => r.up.length + r.down.length >= 20);
+
+  // Flatten the spot series into parallel arrays once; rounds consume it by cursor.
+  const spotTimes: number[] = [];
+  const spotPrices: number[] = [];
+  for (const p of opts.spot ?? []) {
+    spotTimes.push(p.t);
+    spotPrices.push(p.p);
+  }
+  const spotIndex = { times: spotTimes, prices: spotPrices };
+
+  const trades: SimTrade[] = [];
+  for (const r of usable) {
+    const t = replayTickRound(r, opts, spotIndex);
+    if (t) trades.push({ ...t, strategy });
+  }
+
+  const notionalUsd = trades.reduce((s, t) => s + t.entryPrice * t.shares, 0);
+  const grossPnlUsd = trades.reduce((s, t) => s + t.grossPnlUsd, 0);
+  const feesUsd = trades.reduce((s, t) => s + t.feesUsd, 0);
+  const netPnlUsd = trades.reduce((s, t) => s + t.netPnlUsd, 0);
+  const wins = trades.filter((t) => t.netPnlUsd > 0).length;
+
+  if (rounds.length - usable.length > 0) {
+    notes.push(`${rounds.length - usable.length}/${rounds.length} rounds had <20 ticks and were skipped.`);
+  }
+
+  return {
+    strategy,
+    tier: trades.length === 0 ? 'not_testable' : 'faithful',
+    notes,
+    roundsConsidered: rounds.length,
+    roundsWithData: usable.length,
+    trades,
+    metrics: {
+      trades: trades.length,
+      wins,
+      winRate: trades.length ? wins / trades.length : 0,
+      grossPnlUsd,
+      feesUsd,
+      netPnlUsd,
+      returnOnNotionalPct: notionalUsd > 0 ? (netPnlUsd / notionalUsd) * 100 : 0,
+      notionalUsd,
+      avgTradePct: notionalUsd > 0 ? (netPnlUsd / notionalUsd) * 100 : 0,
+      bestTradeUsd: trades.length ? Math.max(...trades.map((t) => t.netPnlUsd)) : 0,
+      worstTradeUsd: trades.length ? Math.min(...trades.map((t) => t.netPnlUsd)) : 0,
+      netPnlIfNoFeesUsd: grossPnlUsd,
+    },
+  };
+}
+
+function emptyMetrics(): BacktestResult['metrics'] {
+  return {
+    trades: 0,
+    wins: 0,
+    winRate: 0,
+    grossPnlUsd: 0,
+    feesUsd: 0,
+    netPnlUsd: 0,
+    returnOnNotionalPct: 0,
+    notionalUsd: 0,
+    avgTradePct: 0,
+    bestTradeUsd: 0,
+    worstTradeUsd: 0,
+    netPnlIfNoFeesUsd: 0,
+  };
 }

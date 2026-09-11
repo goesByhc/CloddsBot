@@ -113,6 +113,78 @@ caveats with every result.
   is the only working combination — it gives **15 points per 15-minute round**.
   `interval=max` silently degrades to 2 points.
 
+---
+
+## 3b. Upgrade: tick-level data (added later the same night)
+
+The minute-bar path above caps out at 24 hours and 15 points per round. A better source
+exists and changes the conclusions.
+
+### Where more data comes from
+
+| Limit | Before | After |
+|---|---|---|
+| Lookback | 24 h (`prices-history` is hard-capped) | **≥120 days** |
+| Points/round | 15 (1-minute bars) | **~960 (individual trade prints)** |
+| Assets | BTC only tested | 6 (BTC/ETH/SOL/XRP/ZEC/DOGE) |
+| Spot feed | none | **Binance 1s klines, free, ≥30 days** |
+
+`data-api.polymarket.com/trades` returns individual fills with
+`timestamp / price / size / side / outcomeIndex / transactionHash` and has **no 24-hour
+cap** — verified present at 120 days back. For one BTC 15m round that is ~960 prints
+covering ~885 of 900 seconds (one print every ~1.5s), versus 15 from `prices-history`.
+
+New tooling: `scripts/crypto-hft-backfill.ts` (resumable JSONL tape cache),
+`scripts/crypto-hft-backtest-ticks.ts` (replay), and a `momentum` port in
+`backtest.ts` that was previously `not_testable`.
+
+### Result — BTC 15m, 672 rounds, 7.0 days, 645,423 prints, $20.9M round volume
+
+```
+                        trades  winRate   gross      fees      NET        fees-off
+momentum                    24    75.0%   +$13.45    $6.19    +$7.26      +$13.45
+mean_reversion             670    44.8%   +$22.96    $0.00    +$22.96     +$22.96
+expiry_fade                667    34.3%   −$42.09  $122.87   −$164.95     −$42.09
+```
+
+**Verdict: two of three strategies clear their costs; one does not, and fees are the reason.**
+
+- `expiry_fade` is the only clear loser, and it loses **before** fees (−$42) and far worse
+  after (−$165). Fees consume **291.9%** of gross P&L. With 667 trades it is by far the
+  most active strategy — activity is exactly what the taker fee punishes. 437 of its 667
+  exits are stop-losses.
+- `mean_reversion` is the only strategy in the black with a defensible sample: 670 trades,
+  +$22.96 net (+1.24% on notional), **$0.034 per trade**. Its `orderMode` is `maker`, so it
+  pays no fee. But a maker fill is an assumption, not an observation — see caveats.
+- `momentum` wins 75% of 24 trades and is profitable after fees, but **24 trades over 7 days
+  is not a sample**. It fires rarely because it needs a 0.15% spot move in 30s plus a ≥2c
+  lag, and the staleness gate (`polyAgeSec ≤ 5`) rejects most candidates at 1.5s print
+  spacing. Treat this as a hypothesis, not a result.
+
+### Caveats that still apply
+
+- **Fill price = the traded print.** No orderbook depth exists historically, so size impact
+  and queue position are unmodelled. `mean_reversion`'s zero fee bill depends on maker fills
+  that this data cannot confirm.
+- **`momentum`'s spot is a proxy.** Binance 1s spot is not the Chainlink TWAP these markets
+  settle on.
+- **`penny_clipper` remains untestable.** It needs quotes (`spread ≤ 0.02`), and a traded
+  print is not a quote. Unlocking it requires recording the live orderbook going forward —
+  i.e. `tickRecorder` plus a TimescaleDB instance.
+- The spread gates on `momentum` and `expiry_fade` are likewise omitted.
+
+### Engine correctness note
+
+Replaying 645k prints exposed two performance bugs and one correctness trap in the pure
+buffer, all fixed and documented in `backtest.ts`:
+
+1. `unshift()` per tick (O(n) memmove) → append-only ascending layout.
+2. Rebuilding a 605k-entry spot `Map` **per round** — the dominant cost; now a cursor.
+3. The live 2000-entry cap is a retention **floor**, not a ceiling. Applying it as a ceiling
+   silently shrank every window. `scripts/verify-buffer-equiv.ts` pins the optimised buffer
+   against a reference implementation over 40,000 values and reports IDENTICAL.
+
+
 ### Result — BTC 15m, 24 rounds / 5.8 hours / $1.2M round volume
 
 ```

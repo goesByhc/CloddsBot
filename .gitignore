@@ -90,3 +90,7 @@ src/api/
 .env.bak*
 *.env.bak
 
+
+# backtest tape/spot caches (large, regenerable via scripts/crypto-hft-backfill.ts)
+.cache/
+
