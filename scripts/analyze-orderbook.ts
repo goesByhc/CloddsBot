@@ -39,6 +39,7 @@ interface BookObs {
   ts: number;
   slug: string;
   asset: string;
+  roundStart: number;
   roundAgeSec: number;
   side: 'up' | 'down';
   bestBid: number | null;
@@ -100,10 +101,12 @@ async function main() {
   }
   const spanMs = books[books.length - 1].ts * 1000 - books[0].ts * 1000;
   const spanMin = spanMs / 60000;
+  // Print the full date, not just HH:MM: a multi-day span otherwise reads as if the
+  // window were under an hour.
+  const fmtTs = (sec: number) => new Date(sec * 1000).toISOString().replace('T', ' ').slice(0, 16);
   console.log(
     `observation window: ${spanMin.toFixed(1)} minutes  ` +
-      `(${new Date(books[0].ts * 1000).toISOString().slice(11, 16)} .. ` +
-      `${new Date(books[books.length - 1].ts * 1000).toISOString().slice(11, 16)} UTC)`
+      `(${fmtTs(books[0].ts)} .. ${fmtTs(books[books.length - 1].ts)} UTC)`
   );
   if (spanMin < 2) {
     console.log(`\n  Only ${spanMin.toFixed(1)} min recorded. The recorder needs to run for a`);
@@ -111,20 +114,27 @@ async function main() {
     return;
   }
 
-  // Index books by slug+side for O(1) nearest lookup.
-  const bySlugSide = new Map<string, BookObs[]>();
+  // Index by ROUND START + asset + side.
+  //
+  // Not by slug: the recorder originally stamped every record with the first asset's
+  // slug, so eth/sol rows carried a `btc-...` slug and a slug-based join matched
+  // nothing at all - 41 entries against 104k observations produced 0 matches. The
+  // round start is the reliable common key and also lets the days already recorded
+  // be used rather than discarded.
+  const byRoundKey = new Map<string, BookObs[]>();
   for (const b of books) {
-    const k = `${b.slug}|${b.side}`;
-    let arr = bySlugSide.get(k);
+    const k = `${b.roundStart}|${b.asset}|${b.side}`;
+    let arr = byRoundKey.get(k);
     if (!arr) {
       arr = [];
-      bySlugSide.set(k, arr);
+      byRoundKey.set(k, arr);
     }
     arr.push(b);
   }
+  for (const arr of byRoundKey.values()) arr.sort((a, b) => a.ts - b.ts);
 
-  function nearest(slug: string, side: 'up' | 'down', tSec: number, tolSec = 20): BookObs | null {
-    const arr = bySlugSide.get(`${slug}|${side}`);
+  function nearest(roundStart: number, asset: string, side: 'up' | 'down', tSec: number, tolSec = 20): BookObs | null {
+    const arr = byRoundKey.get(`${roundStart}|${asset}|${side}`);
     if (!arr) return null;
     let best: BookObs | null = null;
     let bestD = Infinity;
@@ -203,8 +213,14 @@ async function main() {
   const bookImplied: number[] = [];
   const realized: number[] = [];
 
+  // Resolve a round's start from its slug tail, which is the slot unix seconds.
+  const startOfSlug = (slug: string): number => {
+    const m = /-(\d{10})$/.exec(slug);
+    return m ? Number(m[1]) : -1;
+  };
+
   for (const e of entries) {
-    const b = nearest(e.roundSlug, e.direction, e.t);
+    const b = nearest(startOfSlug(e.roundSlug), asset, e.direction, e.t);
     if (!b || b.bestAsk === null) continue;
     matched++;
     askAtEntry.push(b.bestAsk);
@@ -227,12 +243,12 @@ async function main() {
     if (depth > 0) withDepth++;
   }
 
-  // Book-implied probability: use every observation's mid for the Up side, and the
-  // round's realized outcome.
-  const roundBySlug = new Map(rounds.map((r) => [r.slug, r]));
+  // Book-implied probability: every Up-side observation's mid against that round's
+  // realized outcome. Joined on round start, not slug, for the reason noted above.
+  const roundByStart = new Map(rounds.map((r) => [r.startSec, r]));
   for (const b of books) {
     if (b.side !== 'up' || b.mid === null) continue;
-    const r = roundBySlug.get(b.slug);
+    const r = roundByStart.get(b.roundStart);
     if (!r || r.resolvedUp === null) continue;
     bookImplied.push(b.mid);
     realized.push(r.resolvedUp >= 0.5 ? 1 : 0);

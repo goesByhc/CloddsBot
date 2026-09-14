@@ -278,7 +278,7 @@ async function main() {
   let errors = 0;
   let roundsSeen = new Set<string>();
   let lastRoundStart = 0;
-  let cached: Array<{ asset: string; side: 'up' | 'down'; tokenId: string }> = [];
+  let cached: Array<{ asset: string; side: 'up' | 'down'; tokenId: string; slug: string }> = [];
   let cachedMeta: { slug: string; asset: string; durationLabel: string; roundStart: number; roundEnd: number } | null = null;
   const startedAt = Date.now();
 
@@ -310,8 +310,12 @@ async function main() {
             roundEnd: slot + roundDurationSec,
           };
         }
-        cached.push({ asset: a, side: 'up', tokenId: r.up });
-        cached.push({ asset: a, side: 'down', tokenId: r.down });
+        // Carry a PER-ASSET slug on each token entry. Previously every record was
+        // written with meta.slug, which is the FIRST asset that resolved - so eth and
+        // sol rows carried a `btc-...` slug. Any join on slug then silently matched
+        // nothing, and it was hard to see because the round start stayed correct.
+        cached.push({ asset: a, side: 'up', tokenId: r.up, slug: r.slug });
+        cached.push({ asset: a, side: 'down', tokenId: r.down, slug: r.slug });
       }
       cachedMeta = meta;
       lastRoundStart = slot;
@@ -319,7 +323,7 @@ async function main() {
         console.log(`    token resolution failed for: ${failures.join(', ')} (round ${slot})`);
       }
       if (meta) {
-        roundsSeen.add(meta.slug);
+        for (const c of cached) roundsSeen.add(c.slug);
         console.log(
           `  [${new Date().toISOString().slice(11, 19)}] new round ${meta.slug} (${cached.length} tokens), rounds=${roundsSeen.size}`
         );
@@ -332,6 +336,8 @@ async function main() {
     for (const t of cached) {
       const obs = await observeToken(cachedMeta, t.side, t.tokenId, nowSec);
       obs.asset = t.asset;
+      // Per-asset slug, so a join on slug resolves to the same round the tape uses.
+      obs.slug = t.slug;
       if (obs.error) errors++;
       lines.push(JSON.stringify(obs));
       records++;
